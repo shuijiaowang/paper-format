@@ -1,0 +1,42 @@
+{
+  "directory": ".",
+  "styles": {
+    "body": {
+      "east_asia_font": "宋体",
+      "size_pt": 12,
+      "bold": false,
+      "first_line_indent_chars": 2,
+      "line_spacing": 1.5
+    },
+    "h1": {
+      "east_asia_font": "黑体",
+      "size_pt": 15,
+      "bold": false
+    },
+    "h2": {
+      "east_asia_font": "黑体",
+      "size_pt": 14,
+      "bold": false
+    },
+    "h3": {
+      "east_asia_font": "宋体",
+      "size_pt": 12,
+      "bold": true
+    }
+  },
+  "page": {
+    "top_margin_cm": 2.54,
+    "bottom_margin_cm": 2.54,
+    "left_margin_cm": 3.17,
+    "right_margin_cm": 3.17,
+    
+    "header_distance_cm": 1.5,
+    "footer_distance_cm": 1.75,
+    "header_text": "某某大学学士论文",
+    "header_east_asia_font": "宋体",
+    "header_font_size_pt": 10.5,
+    "page_number_start": 0,
+    "page_number_east_asia_font": "宋体",
+    "page_number_font_size_pt": 10.5
+  }
+}
