@@ -2,121 +2,85 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from docx import Document
-from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt
-
-
-STYLE_BODY = "Normal"
-STYLE_H1 = "Heading 1"
-STYLE_H2 = "Heading 2"
-STYLE_H3 = "Heading 3"
+from docx.shared import Pt
 
 OUTPUT_SUFFIX = "_formatted"
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+STYLE_BODY = "body"
+STYLE_H1 = "h1"
+STYLE_H2 = "h2"
+STYLE_H3 = "h3"
 
 
-def ensure_paragraph_style(document: Document, style_name: str) -> None:
-    """Create paragraph style if missing."""
-    if style_name in document.styles:
-        return
-    document.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
-
-
-def set_style_font(
-    document: Document,
-    style_name: str,
-    *,
-    east_asia_font: str,
-    latin_font: str = "Times New Roman",
-    size_pt: float,
-    bold: bool = False,
-    first_line_indent_chars: int = 0,
-    line_spacing: float | None = None,
-) -> None:
-    """Set font attributes for a paragraph style."""
-    ensure_paragraph_style(document, style_name)
-    style = document.styles[style_name]
-    paragraph_format = style.paragraph_format
-    paragraph_format.first_line_indent = Pt(size_pt * first_line_indent_chars)
-    if line_spacing is not None:
-        paragraph_format.line_spacing = line_spacing
-
-    font = style.font
-    font.name = latin_font
-    font.bold = bold
-    font.size = Pt(size_pt)
-    font.element.rPr.rFonts.set(qn("w:eastAsia"), east_asia_font)
-
-
-def apply_run_fonts(document: Document, style_config: dict) -> None:
-    """Apply run-level fonts so English/digits stay Times New Roman."""
-    style_font_map = {
-        STYLE_BODY: style_config["body"]["east_asia_font"],
-        STYLE_H1: style_config["h1"]["east_asia_font"],
-        STYLE_H2: style_config["h2"]["east_asia_font"],
-        STYLE_H3: style_config["h3"]["east_asia_font"],
+def _resolve_alignment(alignment: str | None) -> WD_PARAGRAPH_ALIGNMENT | None:
+    if not alignment:
+        return None
+    mapping = {
+        "left": WD_PARAGRAPH_ALIGNMENT.LEFT,
+        "center": WD_PARAGRAPH_ALIGNMENT.CENTER,
+        "right": WD_PARAGRAPH_ALIGNMENT.RIGHT,
+        "justify": WD_PARAGRAPH_ALIGNMENT.JUSTIFY,
     }
+    return mapping.get(alignment.lower())
 
-    for paragraph in document.paragraphs:
-        east_asia_font = style_font_map.get(paragraph.style.name, style_config["body"]["east_asia_font"])
-        for run in paragraph.runs:
-            run.font.name = "Times New Roman"
-            if run._element.rPr is None:
-                run._element.get_or_add_rPr()
-            r_fonts = run._element.rPr.rFonts
-            if r_fonts is None:
-                r_fonts = OxmlElement("w:rFonts")
-                run._element.rPr.append(r_fonts)
-            r_fonts.set(qn("w:ascii"), "Times New Roman")
-            r_fonts.set(qn("w:hAnsi"), "Times New Roman")
-            r_fonts.set(qn("w:cs"), "Times New Roman")
-            r_fonts.set(qn("w:eastAsia"), east_asia_font)
+
+def _set_run_font(run, east_asia_font: str, size_pt: float, bold: bool) -> None:
+    run.font.name = "Times New Roman"
+    run.font.bold = bold
+    run.font.size = Pt(size_pt)
+    r_pr = run._element.get_or_add_rPr()
+    r_fonts = r_pr.rFonts
+    if r_fonts is None:
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.append(r_fonts)
+    r_fonts.set(qn("w:ascii"), "Times New Roman")
+    r_fonts.set(qn("w:hAnsi"), "Times New Roman")
+    r_fonts.set(qn("w:cs"), "Times New Roman")
+    r_fonts.set(qn("w:eastAsia"), east_asia_font)
+
+
+def apply_paragraph_rule(paragraph, rule: dict[str, float | int | str | bool]) -> None:
+    pf = paragraph.paragraph_format
+    size_pt = float(rule.get("size_pt", 12))
+
+    if "first_line_indent_chars" in rule:
+        pf.first_line_indent = Pt(size_pt * int(rule["first_line_indent_chars"]))
+    if "hanging_indent_chars" in rule:
+        pf.first_line_indent = Pt(0)
+        pf.left_indent = Pt(size_pt * int(rule["hanging_indent_chars"]))
+
+    if "line_spacing_pt" in rule:
+        pf.line_spacing = Pt(float(rule["line_spacing_pt"]))
+    elif "line_spacing" in rule:
+        pf.line_spacing = float(rule["line_spacing"])
+
+    if "space_before_lines" in rule:
+        pf.space_before = Pt(size_pt * float(rule["space_before_lines"]))
+    if "space_after_lines" in rule:
+        pf.space_after = Pt(size_pt * float(rule["space_after_lines"]))
+
+    para_alignment = _resolve_alignment(rule.get("alignment"))
+    if para_alignment is not None:
+        paragraph.alignment = para_alignment
+
+    for run in paragraph.runs:
+        _set_run_font(run, str(rule.get("east_asia_font", "宋体")), size_pt, bool(rule.get("bold", False)))
 
 
 def load_config(config_path: Path) -> dict:
-    """Load formatter config from json."""
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
     return json.loads(config_path.read_text(encoding="utf-8"))
 
 
-def apply_page_config(document: Document, page_config: dict) -> None:
-    """Apply simple page-level config to all sections."""
-    for section in document.sections:
-        if "top_margin_cm" in page_config:
-            section.top_margin = Cm(page_config["top_margin_cm"])
-        elif "top_margin_pt" in page_config:
-            section.top_margin = Pt(page_config["top_margin_pt"])
-
-        if "bottom_margin_cm" in page_config:
-            section.bottom_margin = Cm(page_config["bottom_margin_cm"])
-        elif "bottom_margin_pt" in page_config:
-            section.bottom_margin = Pt(page_config["bottom_margin_pt"])
-
-        if "left_margin_cm" in page_config:
-            section.left_margin = Cm(page_config["left_margin_cm"])
-        elif "left_margin_pt" in page_config:
-            section.left_margin = Pt(page_config["left_margin_pt"])
-
-        if "right_margin_cm" in page_config:
-            section.right_margin = Cm(page_config["right_margin_cm"])
-        elif "right_margin_pt" in page_config:
-            section.right_margin = Pt(page_config["right_margin_pt"])
-
-        if "header_distance_cm" in page_config:
-            section.header_distance = Cm(page_config["header_distance_cm"])
-        if "footer_distance_cm" in page_config:
-            section.footer_distance = Cm(page_config["footer_distance_cm"])
-
-
 def _set_page_number_start(section, start: int) -> None:
-    """Set page numbering start in section properties."""
     sect_pr = section._sectPr
     pg_num_type = sect_pr.find(qn("w:pgNumType"))
     if pg_num_type is None:
@@ -126,7 +90,6 @@ def _set_page_number_start(section, start: int) -> None:
 
 
 def _add_page_number_run(paragraph) -> None:
-    """Insert PAGE field into a paragraph."""
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
 
@@ -143,158 +106,119 @@ def _add_page_number_run(paragraph) -> None:
     run._element.append(fld_end)
 
 
-def _mark_update_fields_on_open(document: Document) -> None:
-    """Ask Word to update fields (including TOC) when opening."""
-    settings = document.settings.element
-    update_fields = settings.find(qn("w:updateFields"))
-    if update_fields is None:
-        update_fields = OxmlElement("w:updateFields")
-        settings.append(update_fields)
-    update_fields.set(qn("w:val"), "true")
-
-
-def apply_header_footer_config(document: Document, page_config: dict) -> None:
-    """Apply header/footer text and page number display."""
-    header_text = page_config.get("header_text", "")
-
+def apply_page_number(document: Document, page_number_config: dict) -> None:
     for section in document.sections:
-        section.different_first_page_header_footer = True
+        section.different_first_page_header_footer = False
         section.odd_and_even_pages_header_footer = False
-        _set_page_number_start(section, page_config.get("page_number_start", 0))
-
-        header = section.header
-        header.is_linked_to_previous = False
-        header_para = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
-        header_para.text = header_text
-        header_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        for run in header_para.runs:
-            run.font.name = "Times New Roman"
-            run.font.size = Pt(page_config.get("header_font_size_pt", 10.5))
-            r_pr = run._element.get_or_add_rPr()
-            r_fonts = r_pr.rFonts
-            if r_fonts is None:
-                r_fonts = OxmlElement("w:rFonts")
-                r_pr.append(r_fonts)
-            r_fonts.set(qn("w:eastAsia"), page_config.get("header_east_asia_font", "宋体"))
-
-        first_page_header = section.first_page_header
-        first_page_header.is_linked_to_previous = False
-        if first_page_header.paragraphs:
-            first_page_header.paragraphs[0].text = ""
+        _set_page_number_start(section, int(page_number_config.get("start", 1)))
 
         footer = section.footer
         footer.is_linked_to_previous = False
         footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
         footer_para.text = ""
-        footer_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+        footer_para.alignment = _resolve_alignment(page_number_config.get("alignment")) or WD_PARAGRAPH_ALIGNMENT.RIGHT
         _add_page_number_run(footer_para)
         for run in footer_para.runs:
-            run.font.name = "Times New Roman"
-            run.font.size = Pt(page_config.get("page_number_font_size_pt", 10.5))
-            r_pr = run._element.get_or_add_rPr()
-            r_fonts = r_pr.rFonts
-            if r_fonts is None:
-                r_fonts = OxmlElement("w:rFonts")
-                r_pr.append(r_fonts)
-            r_fonts.set(qn("w:eastAsia"), page_config.get("page_number_east_asia_font", "宋体"))
-
-        first_page_footer = section.first_page_footer
-        first_page_footer.is_linked_to_previous = False
-        if first_page_footer.paragraphs:
-            first_page_footer.paragraphs[0].text = ""
+            _set_run_font(
+                run,
+                str(page_number_config.get("east_asia_font", "宋体")),
+                float(page_number_config.get("font_size_pt", 9)),
+                False,
+            )
 
 
-def ensure_toc_field(document: Document) -> None:
-    """Ensure a TOC field exists after a '目录' paragraph if present."""
+def _contains_page_break(paragraph) -> bool:
+    for run in paragraph.runs:
+        if "<w:br" in run._element.xml and 'w:type="page"' in run._element.xml:
+            return True
+    return False
+
+
+def _build_page_map(document: Document) -> list[int]:
+    page_no = 1
+    page_map: list[int] = []
     for paragraph in document.paragraphs:
-        xml = paragraph._element.xml
-        if "TOC" in xml and "fldCharType" in xml:
-            return
+        page_map.append(page_no)
+        if _contains_page_break(paragraph):
+            page_no += 1
+    return page_map
 
-    for paragraph in document.paragraphs:
-        if paragraph.text.strip() == "目录":
-            toc_para = paragraph.insert_paragraph_before("")
-            fld_begin = OxmlElement("w:fldChar")
-            fld_begin.set(qn("w:fldCharType"), "begin")
 
-            instr_text = OxmlElement("w:instrText")
-            instr_text.set(qn("xml:space"), "preserve")
-            instr_text.text = r'TOC \o "1-3" \h \z \u'
+def _find_start_index(document: Document, page_map: list[int], processing_cfg: dict) -> int:
+    intro_texts = {"引言", "引  言"}
+    start_page = int(processing_cfg.get("start_page", 5))
+    probe_pages = int(processing_cfg.get("intro_probe_pages", 3))
+    max_probe_page = start_page + max(probe_pages - 1, 0)
 
-            fld_separate = OxmlElement("w:fldChar")
-            fld_separate.set(qn("w:fldCharType"), "separate")
+    for idx, paragraph in enumerate(document.paragraphs):
+        text = paragraph.text.strip()
+        if text in intro_texts and start_page <= page_map[idx] <= max_probe_page:
+            return idx
 
-            fld_end = OxmlElement("w:fldChar")
-            fld_end.set(qn("w:fldCharType"), "end")
+    for idx, paragraph in enumerate(document.paragraphs):
+        if paragraph.text.strip() in intro_texts:
+            return idx
 
-            run = toc_para.add_run()
-            run._element.append(fld_begin)
-            run._element.append(instr_text)
-            run._element.append(fld_separate)
-            run._element.append(fld_end)
-            return
+    for idx, page in enumerate(page_map):
+        if page >= start_page and document.paragraphs[idx].text.strip():
+            return idx
+    return 0
+
+
+def _is_figure_caption(text: str) -> bool:
+    return bool(re.match(r"^图\d+", text))
+
+
+def _resolve_rule_key(paragraph) -> str:
+    style_name = (paragraph.style.name or "").lower()
+    if "heading 1" in style_name or "标题 1" in style_name:
+        return STYLE_H1
+    if "heading 2" in style_name or "标题 2" in style_name:
+        return STYLE_H2
+    if "heading 3" in style_name or "标题 3" in style_name:
+        return STYLE_H3
+    return STYLE_BODY
+
+
+def apply_required_format(document: Document, config: dict) -> None:
+    style_config = config["styles"]
+    page_map = _build_page_map(document)
+    start_idx = _find_start_index(document, page_map, config.get("processing", {}))
+    last_page = max(page_map) if page_map else 1
+
+    in_references = False
+    for idx, paragraph in enumerate(document.paragraphs):
+        if idx < start_idx:
+            continue
+        text = paragraph.text.strip()
+        if not text:
+            continue
+        if page_map[idx] >= last_page:
+            continue
+        if text.startswith("参考文献"):
+            in_references = True
+            continue
+        if in_references:
+            continue
+        if _is_figure_caption(text):
+            continue
+        if paragraph._p.xpath(".//w:drawing"):
+            continue
+        apply_paragraph_rule(paragraph, style_config[_resolve_rule_key(paragraph)])
 
 
 def apply_mvp_format(doc_path: Path, output_path: Path, config: dict) -> None:
-    """Apply minimal formatting rules and save a copy."""
     document = Document(str(doc_path))
-    style_config = config["styles"]
-    page_config = config.get("page", {})
-
-    apply_page_config(document, page_config)
-
-    # 正文：小四（12pt），首行缩进两个字符
-    set_style_font(
-        document,
-        STYLE_BODY,
-        east_asia_font=style_config["body"]["east_asia_font"],
-        size_pt=style_config["body"]["size_pt"],
-        bold=style_config["body"]["bold"],
-        first_line_indent_chars=style_config["body"]["first_line_indent_chars"],
-        line_spacing=style_config["body"].get("line_spacing", 1.5),
-    )
-
-    # 一级标题：小三（15pt）黑体
-    set_style_font(
-        document,
-        STYLE_H1,
-        east_asia_font=style_config["h1"]["east_asia_font"],
-        size_pt=style_config["h1"]["size_pt"],
-        bold=style_config["h1"]["bold"],
-    )
-
-    # 二级标题：四号（14pt）黑体
-    set_style_font(
-        document,
-        STYLE_H2,
-        east_asia_font=style_config["h2"]["east_asia_font"],
-        size_pt=style_config["h2"]["size_pt"],
-        bold=style_config["h2"]["bold"],
-    )
-
-    # 三级标题：小四（12pt）宋体加粗
-    set_style_font(
-        document,
-        STYLE_H3,
-        east_asia_font=style_config["h3"]["east_asia_font"],
-        size_pt=style_config["h3"]["size_pt"],
-        bold=style_config["h3"]["bold"],
-    )
-
-    apply_run_fonts(document, style_config)
-    apply_header_footer_config(document, page_config)
-    ensure_toc_field(document)
-    _mark_update_fields_on_open(document)
-
+    apply_required_format(document, config)
+    apply_page_number(document, config.get("page_number", {}))
     document.save(str(output_path))
 
 
 def iter_docx_files(root_dir: Path) -> list[Path]:
-    """Find .docx files recursively and skip temp files."""
     return [
         p
         for p in root_dir.rglob("*.docx")
-        if p.is_file() and not p.name.startswith("~$")
+        if p.is_file() and not p.name.startswith("~$") and not p.stem.endswith(OUTPUT_SUFFIX)
     ]
 
 
@@ -330,7 +254,10 @@ def main() -> int:
         print(f"[ERROR] Failed to load config: {exc}")
         return 1
 
+    config_base_dir = args.config.resolve().parent
     configured_directory = Path(config.get("directory", "."))
+    if not configured_directory.is_absolute():
+        configured_directory = (config_base_dir / configured_directory).resolve()
     target_dir = args.directory or configured_directory
     target_dir = target_dir.resolve()
 
