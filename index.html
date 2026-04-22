@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>论文格式化工具</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f5f7fb;
+        color: #222;
+      }
+      .card {
+        max-width: 520px;
+        margin: 80px auto;
+        background: #fff;
+        padding: 24px;
+        border-radius: 10px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+      }
+      h1 {
+        margin-top: 0;
+        font-size: 22px;
+      }
+      .hint {
+        color: #666;
+        margin-bottom: 16px;
+      }
+      .row {
+        margin-bottom: 12px;
+      }
+      button {
+        background: #1663ff;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 10px 16px;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      #status {
+        margin-top: 12px;
+        min-height: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>DOCX 论文格式化</h1>
+      <div class="hint">上传 Word 文档，处理完成后会自动下载。</div>
+      <div class="row">
+        <input id="fileInput" type="file" accept=".docx" />
+      </div>
+      <button id="submitBtn">上传并格式化</button>
+      <div id="status"></div>
+    </div>
+
+    <script>
+      const submitBtn = document.getElementById("submitBtn");
+      const fileInput = document.getElementById("fileInput");
+      const statusEl = document.getElementById("status");
+
+      submitBtn.addEventListener("click", async () => {
+        const file = fileInput.files[0];
+        if (!file) {
+          statusEl.textContent = "请先选择一个 .docx 文件。";
+          return;
+        }
+
+        submitBtn.disabled = true;
+        statusEl.textContent = "处理中，请稍候...";
+
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+
+          const response = await fetch("/api/format", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!response.ok) {
+            let message = "处理失败";
+            try {
+              const data = await response.json();
+              message = data.error || message;
+            } catch (e) {}
+            throw new Error(message);
+          }
+
+          const blob = await response.blob();
+          const url = window.URL.createObjectURL(blob);
+          const contentDisposition = response.headers.get("Content-Disposition") || "";
+          const utf8Matched = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+          const plainMatched = contentDisposition.match(/filename="?([^"]+)"?/i);
+          const fileName = utf8Matched
+            ? decodeURIComponent(utf8Matched[1])
+            : plainMatched
+              ? plainMatched[1]
+              : "formatted.docx";
+
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = fileName;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          window.URL.revokeObjectURL(url);
+
+          statusEl.textContent = "处理完成，已开始下载。";
+        } catch (error) {
+          statusEl.textContent = `出错：${error.message}`;
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>

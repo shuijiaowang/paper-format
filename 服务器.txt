@@ -1,0 +1,33 @@
+
+
+
+python环境管理器：装 Python 版本/虚拟环境的，Ubuntu 可以用。
+
+
+
+sudo apt update
+sudo apt install -y build-essential curl wget git \
+libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+libffi-dev liblzma-dev tk-dev uuid-dev
+
+
+
+
+cd /www/wwwroot/paper-format
+
+# 1) 先确认 Python 3.10 在
+python3.10 -V
+# 2) 如果报 venv 模块不存在，先装它（Ubuntu）
+apt update && apt install -y python3.10-venv
+# 3) 创建项目虚拟环境（放在项目里）
+python3.10 -m venv .venv
+# 4) 进入虚拟环境
+source .venv/bin/activate
+# 5) 确认当前 pip 属于 .venv
+which python
+which pip
+# 6) 在虚拟环境里装依赖
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+# 7) 启动
+python app.py

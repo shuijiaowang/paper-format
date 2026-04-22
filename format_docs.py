@@ -2,32 +2,81 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+from copy import deepcopy
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from docx import Document
 from docx.opc.constants import CONTENT_TYPE as CT
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.opc.packuri import PackURI
-from docx.oxml import parse_xml
-from docx.parts.numbering import NumberingPart
-from docx.enum.section import WD_SECTION_START
-from docx.enum.text import WD_BREAK
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.oxml import OxmlElement
+from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
+from docx.parts.numbering import NumberingPart
+from docx.enum.text import WD_BREAK, WD_LINE_SPACING, WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Cm, Pt
 from docx.text.paragraph import Paragraph
 
-OUTPUT_SUFFIX = "_formatted"
+
+# ============================================================
+# --- config & constants ---
+# ============================================================
+
+OUTPUT_SUFFIX = "_f"
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+
 STYLE_BODY = "body"
 STYLE_H1 = "h1"
 STYLE_H2 = "h2"
 STYLE_H3 = "h3"
-SPECIAL_H1_TITLES = {"引言", "结语", "参考文献", "致谢"}
+
 H1_PREFIXES = "一二三四五六七八九十"
 
+INTRO_TITLE_TEXT = "引言"
+CONCLUSION_TITLE_TEXT = "结语"
+REFERENCES_TITLE_TEXT = "参考文献"
+ACK_TITLE_TEXT = "致谢"
+
+REFERENCES_BODY_RULE = {
+    "east_asia_font": "宋体",
+    "size_pt": 10.5,
+    "bold": False,
+    "line_spacing": 1.5,
+    "alignment": "left",
+    "hanging_indent_chars": 2,
+}
+
+
+def load_config(config_path: Path) -> dict:
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def _debug_enabled(config: dict | None) -> bool:
+    if os.environ.get("PAPER_FORMAT_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if not config:
+        return False
+    debug_config = config.get("debug")
+    if isinstance(debug_config, bool):
+        return debug_config
+    if isinstance(debug_config, dict):
+        return bool(debug_config.get("enabled", False))
+    return False
+
+
+def _debug_log(config: dict | None, message: str) -> None:
+    if _debug_enabled(config):
+        print(f"[DEBUG] {message}")
+
+
+# ============================================================
+# --- low-level docx helpers ---
+# ============================================================
 
 def _resolve_alignment(alignment: str | None) -> WD_PARAGRAPH_ALIGNMENT | None:
     if not alignment:
@@ -37,6 +86,8 @@ def _resolve_alignment(alignment: str | None) -> WD_PARAGRAPH_ALIGNMENT | None:
         "center": WD_PARAGRAPH_ALIGNMENT.CENTER,
         "right": WD_PARAGRAPH_ALIGNMENT.RIGHT,
         "justify": WD_PARAGRAPH_ALIGNMENT.JUSTIFY,
+        "distributed": WD_PARAGRAPH_ALIGNMENT.DISTRIBUTE,
+        "distribute": WD_PARAGRAPH_ALIGNMENT.DISTRIBUTE,
     }
     return mapping.get(alignment.lower())
 
@@ -61,7 +112,7 @@ def _clear_indent(pf) -> None:
     pf.left_indent = None
 
 
-def apply_paragraph_rule(paragraph, rule: dict[str, float | int | str | bool]) -> None:
+def apply_paragraph_rule(paragraph, rule: dict) -> None:
     pf = paragraph.paragraph_format
     size_pt = float(rule.get("size_pt", 12))
     _clear_indent(pf)
@@ -87,13 +138,144 @@ def apply_paragraph_rule(paragraph, rule: dict[str, float | int | str | bool]) -
         paragraph.alignment = para_alignment
 
     for run in paragraph.runs:
-        _set_run_font(run, str(rule.get("east_asia_font", "宋体")), size_pt, bool(rule.get("bold", False)))
+        _set_run_font(
+            run,
+            str(rule.get("east_asia_font", "宋体")),
+            size_pt,
+            bool(rule.get("bold", False)),
+        )
 
 
-def load_config(config_path: Path) -> dict:
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    return json.loads(config_path.read_text(encoding="utf-8"))
+def _set_paragraph_text(paragraph, text: str) -> None:
+    if not paragraph.runs:
+        paragraph.add_run(text)
+        return
+    paragraph.runs[0].text = text
+    for run in paragraph.runs[1:]:
+        run.text = ""
+
+
+def _prev_paragraph(paragraph) -> Paragraph | None:
+    element = paragraph._p.getprevious()
+    while element is not None and element.tag != qn("w:p"):
+        element = element.getprevious()
+    if element is None:
+        return None
+    return Paragraph(element, paragraph._parent)
+
+
+def _next_paragraph(paragraph) -> Paragraph | None:
+    element = paragraph._p.getnext()
+    while element is not None and element.tag != qn("w:p"):
+        element = element.getnext()
+    if element is None:
+        return None
+    return Paragraph(element, paragraph._parent)
+
+
+def _is_blank_paragraph(paragraph) -> bool:
+    # 仅含换页符的段落文本为空，但属于结构内容，不视作空行。
+    if paragraph._p is None:
+        return True
+    if paragraph._p.xpath(".//w:br[@w:type='page']"):
+        return False
+    return not paragraph.text.strip()
+
+
+def _insert_blank_paragraph_before(paragraph) -> Paragraph:
+    p = OxmlElement("w:p")
+    paragraph._p.addprevious(p)
+    return Paragraph(p, paragraph._parent)
+
+
+def _insert_blank_paragraph_after(paragraph) -> Paragraph:
+    p = OxmlElement("w:p")
+    paragraph._p.addnext(p)
+    return Paragraph(p, paragraph._parent)
+
+
+def _delete_paragraph(paragraph) -> None:
+    # 仅把节点从 XML 树上摘除；保留 Paragraph 包装对象的 _p 引用，
+    # 这样调用方对已删段落再做只读访问（比如 .text）也不会炸。
+    p = paragraph._element
+    parent = p.getparent()
+    if parent is not None:
+        parent.remove(p)
+
+
+def _paragraph_has_page_break(paragraph) -> bool:
+    if paragraph._p is None:
+        return False
+    return bool(paragraph._p.xpath(".//w:br[@w:type='page']"))
+
+
+def _ensure_page_break_before(paragraph) -> None:
+    prev = _prev_paragraph(paragraph)
+    if prev is None:
+        return
+    if _paragraph_has_page_break(prev):
+        return
+    prev.add_run().add_break(WD_BREAK.PAGE)
+
+
+def _make_blank_body_paragraph(blank: Paragraph, body_rule: dict) -> None:
+    apply_paragraph_rule(blank, body_rule)
+    blank.paragraph_format.first_line_indent = Pt(0)
+
+
+def _ensure_blank_before(paragraph, body_rule: dict) -> None:
+    prev = _prev_paragraph(paragraph)
+    if prev is not None and _is_blank_paragraph(prev):
+        return
+    blank = _insert_blank_paragraph_before(paragraph)
+    _make_blank_body_paragraph(blank, body_rule)
+
+
+def _ensure_blank_after(paragraph, body_rule: dict) -> None:
+    nxt = _next_paragraph(paragraph)
+    if nxt is not None and _is_blank_paragraph(nxt):
+        return
+    blank = _insert_blank_paragraph_after(paragraph)
+    _make_blank_body_paragraph(blank, body_rule)
+
+
+def _remove_blanks_before(paragraph) -> None:
+    while True:
+        prev = _prev_paragraph(paragraph)
+        if prev is None or not _is_blank_paragraph(prev):
+            return
+        _delete_paragraph(prev)
+
+
+def _remove_blanks_after(paragraph) -> None:
+    while True:
+        nxt = _next_paragraph(paragraph)
+        if nxt is None or not _is_blank_paragraph(nxt):
+            return
+        _delete_paragraph(nxt)
+
+
+def _collapse_blanks_before(paragraph, max_count: int = 1) -> None:
+    """把标题前的连续空行压缩到不超过 max_count 行。"""
+    while True:
+        prev = _prev_paragraph(paragraph)
+        if prev is None or not _is_blank_paragraph(prev):
+            return
+        prev_prev = _prev_paragraph(prev)
+        if prev_prev is None or not _is_blank_paragraph(prev_prev):
+            return
+        _delete_paragraph(prev_prev)
+
+
+def _collapse_blanks_after(paragraph, max_count: int = 1) -> None:
+    while True:
+        nxt = _next_paragraph(paragraph)
+        if nxt is None or not _is_blank_paragraph(nxt):
+            return
+        nxt_nxt = _next_paragraph(nxt)
+        if nxt_nxt is None or not _is_blank_paragraph(nxt_nxt):
+            return
+        _delete_paragraph(nxt_nxt)
 
 
 def _set_page_number_start(section, start: int) -> None:
@@ -122,142 +304,15 @@ def _add_page_number_run(paragraph) -> None:
     run._element.append(fld_end)
 
 
+def _remove_footer_references(section) -> None:
+    sect_pr = section._sectPr
+    for node in list(sect_pr.findall(qn("w:footerReference"))):
+        sect_pr.remove(node)
+
+
 def _clear_footer(footer) -> None:
     for paragraph in footer.paragraphs:
         paragraph.text = ""
-
-
-def _insert_blank_paragraph_before(paragraph):
-    p = OxmlElement("w:p")
-    paragraph._p.addprevious(p)
-    return Paragraph(p, paragraph._parent)
-
-
-def _insert_blank_paragraph_after(paragraph):
-    p = OxmlElement("w:p")
-    paragraph._p.addnext(p)
-    return Paragraph(p, paragraph._parent)
-
-
-def _is_blank_paragraph(paragraph) -> bool:
-    # A paragraph that only contains a page break has empty text,
-    # but it is structural content and must not be treated as blank.
-    if paragraph._p.xpath(".//w:br[@w:type='page']"):
-        return False
-    return not paragraph.text.strip()
-
-
-def _delete_paragraph(paragraph) -> None:
-    p = paragraph._element
-    parent = p.getparent()
-    if parent is not None:
-        parent.remove(p)
-    paragraph._p = paragraph._element = None
-
-
-def _ensure_margins(document: Document) -> None:
-    for section in document.sections:
-        section.top_margin = Cm(2.5)
-        section.bottom_margin = Cm(2.5)
-        section.left_margin = Cm(2.5)
-        section.right_margin = Cm(2.5)
-
-
-def _find_start_index(document: Document) -> int:
-    for idx, paragraph in enumerate(document.paragraphs):
-        if _is_intro_title(paragraph.text):
-            return idx
-
-    for idx, paragraph in enumerate(document.paragraphs):
-        if paragraph.text.strip():
-            return idx
-    return 0
-
-
-def _is_figure_caption(text: str) -> bool:
-    return bool(re.match(r"^图\d+(-\d+)?", text))
-
-
-def _normalize_title_token(text: str) -> str:
-    token = text.strip()
-    token = re.sub(r"^[（(]\s*[一二三四五六七八九十]+\s*[)）]", "", token)
-    token = re.sub(r"^[一二三四五六七八九十]+、", "", token)
-    token = re.sub(r"^\d+(?:\.\d+)*\.", "", token)
-    token = re.sub(r"[\s·•\\-—_<>《》【】\\[\\]()（）:：,，。；;!！?？\"'`]+", "", token)
-    return token
-
-
-def _reference_title_tokens(config: dict) -> set[str]:
-    structure_config = config.get("structure", {})
-    configured = _normalize_title_token(structure_config.get("references_title", "参考文献"))
-    tokens = {"参考文献", "引用", "引用页"}
-    if configured:
-        tokens.add(configured)
-    return {_normalize_title_token(token) for token in tokens if token}
-
-
-def _is_reference_title(text: str, config: dict) -> bool:
-    return _normalize_title_token(text) in _reference_title_tokens(config)
-
-
-def _strip_number_prefix(text: str) -> str:
-    candidate = text.strip()
-    candidate = re.sub(r"^[一二三四五六七八九十]+、", "", candidate)
-    candidate = re.sub(r"^（[一二三四五六七八九十]+）", "", candidate)
-    candidate = re.sub(r"^\(\s*[一二三四五六七八九十]+\s*\)", "", candidate)
-    candidate = re.sub(r"^\d+(?:\.\d+)*\.", "", candidate)
-    return candidate.strip()
-
-
-def _is_intro_title(text: str) -> bool:
-    return _normalize_title_token(text) == "引言"
-
-
-def _heading_level_by_prefix(text: str) -> int | None:
-    t = text.strip()
-    if re.match(r"^[一二三四五六七八九十]+、", t):
-        return 1
-    if re.match(r"^(（[一二三四五六七八九十]+）|\(\s*[一二三四五六七八九十]+\s*\))", t):
-        return 2
-    if re.match(r"^\d+(?:\.\d+)*\.", t):
-        return 3
-    return None
-
-
-def _resolve_rule_key(paragraph) -> str:
-    style_name = (paragraph.style.name or "").lower()
-    if "heading 1" in style_name or "标题 1" in style_name:
-        return STYLE_H1
-    if "heading 2" in style_name or "标题 2" in style_name:
-        return STYLE_H2
-    if "heading 3" in style_name or "标题 3" in style_name:
-        return STYLE_H3
-    return STYLE_BODY
-
-
-def _looks_like_heading(paragraph) -> bool:
-    text = paragraph.text.strip()
-    if not text:
-        return False
-    style_key = _resolve_rule_key(paragraph)
-    if style_key in {STYLE_H1, STYLE_H2, STYLE_H3}:
-        return True
-    if text in SPECIAL_H1_TITLES:
-        return True
-    if _heading_level_by_prefix(text) is not None:
-        return True
-    if len(text) <= 24 and not any(ch in text for ch in "，。；：！？,.?!:;"):
-        return True
-    return False
-
-
-def _set_paragraph_text(paragraph, text: str) -> None:
-    if not paragraph.runs:
-        paragraph.add_run(text)
-        return
-    paragraph.runs[0].text = text
-    for run in paragraph.runs[1:]:
-        run.text = ""
 
 
 def _get_or_create_numbering_part(document: Document) -> NumberingPart:
@@ -375,67 +430,481 @@ def _set_heading_numbering(paragraph, num_id: int, level: int) -> None:
     num_id_node.set(qn("w:val"), str(num_id))
 
 
-def _format_heading_text(text: str, level: int, i1: int, i2: int, i3: int) -> str:
-    core = _strip_number_prefix(text)
-    if level == 1:
-        if not (1 <= i1 <= len(H1_PREFIXES)):
-            prefix = f"{i1}、"
-        else:
-            prefix = f"{H1_PREFIXES[i1 - 1]}、"
-        return f"{prefix}{core}"
-    if level == 2:
-        if not (1 <= i2 <= len(H1_PREFIXES)):
-            prefix = f"({i2})"
-        else:
-            prefix = f"（{H1_PREFIXES[i2 - 1]}）"
-        return f"{prefix}{core}"
-    return f"{i3}.{core}"
+# ============================================================
+# --- landmark detection & segmentation ---
+# ============================================================
+
+class Landmark(Enum):
+    INTRO = "intro"
+    CONCLUSION = "conclusion"
+    REFERENCES = "references"
+    ACK = "ack"
 
 
-def _find_section_by_sectpr(document: Document, sect_pr):
+def _normalize_title_token(text: str) -> str:
+    token = text.strip()
+    token = re.sub(r"^[（(]\s*[一二三四五六七八九十]+\s*[)）]", "", token)
+    token = re.sub(r"^[一二三四五六七八九十]+、", "", token)
+    token = re.sub(r"^\d+(?:\.\d+)*\.", "", token)
+    token = re.sub(r"[\s·•\\-—_<>《》【】\\[\\]()（）:：,，。；;!！?？\"'`]+", "", token)
+    return token
+
+
+def _strip_number_prefix(text: str) -> str:
+    candidate = text.strip()
+    candidate = re.sub(r"^[一二三四五六七八九十]+、", "", candidate)
+    candidate = re.sub(r"^（[一二三四五六七八九十]+）", "", candidate)
+    candidate = re.sub(r"^\(\s*[一二三四五六七八九十]+\s*\)", "", candidate)
+    candidate = re.sub(r"^\d+(?:\.\d+)*\.", "", candidate)
+    return candidate.strip()
+
+
+def _reference_title_tokens(config: dict) -> set[str]:
+    structure_config = config.get("structure", {})
+    configured = _normalize_title_token(
+        structure_config.get("references_title", REFERENCES_TITLE_TEXT)
+    )
+    tokens = {REFERENCES_TITLE_TEXT, "引用", "引用页"}
+    if configured:
+        tokens.add(configured)
+    return {_normalize_title_token(token) for token in tokens if token}
+
+
+def _compact_stripped(text: str) -> str:
+    return re.sub(r"\s+", "", _strip_number_prefix(text))
+
+
+def _paragraph_debug_summary(paragraph) -> str:
+    text = paragraph.text.replace("\n", "\\n")
+    style_name = (paragraph.style.name or "").strip()
+    has_field = bool(paragraph._p.xpath(".//w:fldSimple")) or bool(paragraph._p.xpath(".//w:instrText"))
+    return f"text='{text}', style='{style_name}', has_field={has_field}"
+
+
+def detect_landmark(paragraph, config: dict) -> Landmark | None:
+    """唯一真值源：把一个段落识别为某个里程碑，或返回 None。"""
+    text = paragraph.text
+    if not text.strip():
+        return None
+    normalized = _normalize_title_token(text)
+    compact = _compact_stripped(text)
+
+    if compact == INTRO_TITLE_TEXT or normalized == INTRO_TITLE_TEXT:
+        return Landmark.INTRO
+    if compact == CONCLUSION_TITLE_TEXT or normalized == CONCLUSION_TITLE_TEXT:
+        return Landmark.CONCLUSION
+    if normalized in _reference_title_tokens(config):
+        return Landmark.REFERENCES
+    if normalized == ACK_TITLE_TEXT:
+        return Landmark.ACK
+    return None
+
+
+@dataclass
+class DocumentSegments:
+    """把整份文档按里程碑切分后各段的段落引用。每段互不依赖。"""
+
+    document: Document
+    intro_title: Paragraph | None = None
+    conclusion_title: Paragraph | None = None
+    body_paragraphs: list[Paragraph] = field(default_factory=list)
+    references_title: Paragraph | None = None
+    references_body: list[Paragraph] = field(default_factory=list)
+    ack_title: Paragraph | None = None
+    ack_body: list[Paragraph] = field(default_factory=list)
+
+
+def scan_segments(document: Document, config: dict) -> DocumentSegments:
+    paragraphs = list(document.paragraphs)
+    landmarks: dict[Landmark, int] = {}
+    for idx, paragraph in enumerate(paragraphs):
+        lm = detect_landmark(paragraph, config)
+        # 只记录第一次出现，避免正文里偶然出现 "引言" 字样干扰。
+        if lm is not None and lm not in landmarks:
+            landmarks[lm] = idx
+            _debug_log(
+                config,
+                f"landmark[{lm.value}] at idx={idx}: {_paragraph_debug_summary(paragraph)}",
+            )
+
+    intro_idx = landmarks.get(Landmark.INTRO)
+    conclusion_idx = landmarks.get(Landmark.CONCLUSION)
+    refs_idx = landmarks.get(Landmark.REFERENCES)
+    ack_idx = landmarks.get(Landmark.ACK)
+
+    segments = DocumentSegments(document=document)
+
+    # Body 段：从 引言 到 参考文献/致谢 之前（含结语）
+    if intro_idx is not None:
+        segments.intro_title = paragraphs[intro_idx]
+        body_end = min(
+            (i for i in (refs_idx, ack_idx) if i is not None and i > intro_idx),
+            default=len(paragraphs),
+        )
+        segments.body_paragraphs = paragraphs[intro_idx:body_end]
+        if conclusion_idx is not None and intro_idx < conclusion_idx < body_end:
+            segments.conclusion_title = paragraphs[conclusion_idx]
+    elif refs_idx is None and ack_idx is None:
+        # 兼容遗留文档：完全没有里程碑时，把首个非空段落之后当作正文。
+        first_non_empty = next(
+            (i for i, p in enumerate(paragraphs) if p.text.strip()), None
+        )
+        if first_non_empty is not None:
+            segments.body_paragraphs = paragraphs[first_non_empty:]
+
+    # References 段
+    if refs_idx is not None:
+        segments.references_title = paragraphs[refs_idx]
+        refs_end = ack_idx if ack_idx is not None and ack_idx > refs_idx else len(paragraphs)
+        segments.references_body = paragraphs[refs_idx + 1 : refs_end]
+
+    # Ack 段
+    if ack_idx is not None:
+        segments.ack_title = paragraphs[ack_idx]
+        segments.ack_body = paragraphs[ack_idx + 1 :]
+
+    return segments
+
+
+# ============================================================
+# --- segment processors ---
+# ============================================================
+
+def _heading_level_by_prefix(text: str) -> int | None:
+    t = text.strip()
+    if re.match(r"^[一二三四五六七八九十]+、", t):
+        return 1
+    if re.match(r"^(（[一二三四五六七八九十]+）|\(\s*[一二三四五六七八九十]+\s*\))", t):
+        return 2
+    if re.match(r"^\d+(?:\.\d+)*\.", t):
+        return 3
+    return None
+
+
+def _resolve_style_rule_key(paragraph) -> str:
+    style_name = (paragraph.style.name or "").lower()
+    if "heading 1" in style_name or "标题 1" in style_name:
+        return STYLE_H1
+    if "heading 2" in style_name or "标题 2" in style_name:
+        return STYLE_H2
+    if "heading 3" in style_name or "标题 3" in style_name:
+        return STYLE_H3
+    return STYLE_BODY
+
+
+def _looks_like_heading(paragraph) -> bool:
+    text = paragraph.text.strip()
+    if not text:
+        return False
+    style_key = _resolve_style_rule_key(paragraph)
+    if style_key in {STYLE_H1, STYLE_H2, STYLE_H3}:
+        return True
+    if _heading_level_by_prefix(text) is not None:
+        return True
+    if len(text) <= 24 and not any(ch in text for ch in "，。；：！？,.?!:;"):
+        return True
+    return False
+
+
+def _resolve_heading_level(paragraph) -> int:
+    text = paragraph.text.strip()
+    level = _heading_level_by_prefix(text)
+    if level is not None:
+        return level
+    style_key = _resolve_style_rule_key(paragraph)
+    if style_key == STYLE_H2:
+        return 2
+    if style_key == STYLE_H3:
+        return 3
+    return 1
+
+
+def _is_figure_caption(text: str) -> bool:
+    # 仅识别 "图N" 开头的段落，不强制 "图N-N" 形式。
+    return bool(re.match(r"^图\s*\d+", text.strip()))
+
+
+def _apply_figure_caption(paragraph, body_rule: dict) -> None:
+    apply_paragraph_rule(paragraph, body_rule)
+    paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    paragraph.paragraph_format.first_line_indent = Pt(0)
+    paragraph.paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    paragraph.paragraph_format.line_spacing = Pt(20)
+    for run in paragraph.runs:
+        _set_run_font(run, "黑体", 10.5, False)
+
+
+def _apply_page_title_style(paragraph, rule: dict) -> None:
+    """应用独立成页的标题样式：套规则 + 强制 space_before=0（因为前面是换页）。"""
+    apply_paragraph_rule(paragraph, rule)
+    paragraph.paragraph_format.space_before = Pt(0)
+
+
+# ---------- Body (引言 -> 结语) ----------
+
+def process_body(segments: DocumentSegments, config: dict) -> None:
+    """独立处理正文段：引言 / H1 / H2 / H3 / 图序 / 正文 / 结语，含段内空行规则。"""
+    if not segments.body_paragraphs:
+        return
+
+    style_config = config["styles"]
+    body_rule = style_config[STYLE_BODY]
+    h1_rule = style_config[STYLE_H1]
+    h2_rule = style_config[STYLE_H2]
+    h3_rule = style_config[STYLE_H3]
+
+    heading_num_id = _create_heading_numbering(segments.document)
+
+    chapter_idx = 0
+    section_idx = 0
+    sub_idx = 0
+
+    intro_title = segments.intro_title
+    conclusion_title = segments.conclusion_title
+
+    for paragraph in segments.body_paragraphs:
+        if paragraph._p is None:
+            continue
+        text = paragraph.text.strip()
+        if not text:
+            continue
+
+        # 引言：前换页（自然）+ 前不空 + 后空一行；不参与编号
+        if paragraph is intro_title:
+            _set_paragraph_text(paragraph, INTRO_TITLE_TEXT)
+            _apply_page_title_style(paragraph, h1_rule)
+            _remove_blanks_before(paragraph)
+            _ensure_blank_after(paragraph, body_rule)
+            _collapse_blanks_after(paragraph)
+            chapter_idx = 0
+            section_idx = 0
+            sub_idx = 0
+            continue
+
+        # 结语：上下各空一行；不参与编号
+        if paragraph is conclusion_title:
+            _set_paragraph_text(paragraph, CONCLUSION_TITLE_TEXT)
+            apply_paragraph_rule(paragraph, h1_rule)
+            _ensure_blank_before(paragraph, body_rule)
+            _collapse_blanks_before(paragraph)
+            _ensure_blank_after(paragraph, body_rule)
+            _collapse_blanks_after(paragraph)
+            continue
+
+        # 脚注 / 图片：保持原样
+        if paragraph._p.xpath(".//w:footnoteReference"):
+            continue
+        if paragraph._p.xpath(".//w:drawing"):
+            continue
+
+        if _is_figure_caption(text):
+            _apply_figure_caption(paragraph, body_rule)
+            continue
+
+        if _looks_like_heading(paragraph):
+            level = _resolve_heading_level(paragraph)
+            plain = _strip_number_prefix(text)
+            if level == 1:
+                chapter_idx += 1
+                section_idx = 0
+                sub_idx = 0
+                _set_paragraph_text(paragraph, plain)
+                _set_heading_numbering(paragraph, heading_num_id, 0)
+                apply_paragraph_rule(paragraph, h1_rule)
+                _ensure_blank_before(paragraph, body_rule)
+                _collapse_blanks_before(paragraph)
+                _ensure_blank_after(paragraph, body_rule)
+                _collapse_blanks_after(paragraph)
+            elif level == 2:
+                if chapter_idx == 0:
+                    chapter_idx = 1
+                section_idx += 1
+                sub_idx = 0
+                _set_paragraph_text(paragraph, plain)
+                _set_heading_numbering(paragraph, heading_num_id, 1)
+                apply_paragraph_rule(paragraph, h2_rule)
+                # 二级标题上下无换行
+                _remove_blanks_before(paragraph)
+                _remove_blanks_after(paragraph)
+            else:
+                if chapter_idx == 0:
+                    chapter_idx = 1
+                if section_idx == 0:
+                    section_idx = 1
+                sub_idx += 1
+                _set_paragraph_text(paragraph, plain)
+                _set_heading_numbering(paragraph, heading_num_id, 2)
+                apply_paragraph_rule(paragraph, h3_rule)
+                # 三级标题：上空一行，下不空
+                _ensure_blank_before(paragraph, body_rule)
+                _collapse_blanks_before(paragraph)
+                _remove_blanks_after(paragraph)
+            continue
+
+        # 普通正文：不清理前后空行（保留手动空行）
+        apply_paragraph_rule(paragraph, body_rule)
+
+
+# ---------- References ----------
+
+def process_references(segments: DocumentSegments, config: dict) -> None:
+    """独立处理参考文献段。"""
+    if segments.references_title is None:
+        return
+
+    title = segments.references_title
+    _set_paragraph_text(title, REFERENCES_TITLE_TEXT)
+    _apply_page_title_style(title, config["styles"][STYLE_H1])
+
+    # 前换页、前不空行、后空一行
+    _ensure_page_break_before(title)
+    _remove_blanks_before(title)
+    body_rule = config["styles"][STYLE_BODY]
+    _ensure_blank_after(title, body_rule)
+    _collapse_blanks_after(title)
+
+    for paragraph in segments.references_body:
+        if _is_blank_paragraph(paragraph):
+            continue
+        apply_paragraph_rule(paragraph, REFERENCES_BODY_RULE)
+
+
+# ---------- Acknowledgment ----------
+
+def process_acknowledgment(segments: DocumentSegments, config: dict) -> None:
+    """独立处理致谢段。"""
+    if segments.ack_title is None:
+        return
+
+    title = segments.ack_title
+    _set_paragraph_text(title, ACK_TITLE_TEXT)
+    _apply_page_title_style(title, config["styles"][STYLE_H1])
+
+    _ensure_page_break_before(title)
+    _remove_blanks_before(title)
+    body_rule = config["styles"][STYLE_BODY]
+    _ensure_blank_after(title, body_rule)
+    _collapse_blanks_after(title)
+
+    for paragraph in segments.ack_body:
+        if _is_blank_paragraph(paragraph):
+            continue
+        if paragraph._p.xpath(".//w:footnoteReference"):
+            continue
+        apply_paragraph_rule(paragraph, body_rule)
+
+
+# ============================================================
+# --- document-wide setup ---
+# ============================================================
+
+def _ensure_margins(document: Document) -> None:
     for section in document.sections:
-        if section._sectPr is sect_pr:
-            return section
-    return document.sections[-1]
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2.5)
+        section.left_margin = Cm(2.5)
+        section.right_margin = Cm(2.5)
 
 
-def _insert_intro_section_break(document: Document, start_idx: int):
-    if start_idx <= 0:
-        return document.sections[0]
-    p = document.paragraphs[start_idx - 1]
-    sec_pr = p._p.pPr.sectPr if p._p.pPr is not None else None
-    if sec_pr is not None:
-        return _find_section_by_sectpr(document, sec_pr)
-    new_section = document.add_section(WD_SECTION_START.NEW_PAGE)
-    moved = new_section._sectPr
+def _section_index_for_paragraph(document: Document, paragraph) -> int:
+    target_p = paragraph._p
+    section_idx = 0
     body = document._body._element
-    body.remove(moved)
-    p._p.addnext(moved)
-    return _find_section_by_sectpr(document, moved)
+    for child in body.iterchildren():
+        if child is target_p:
+            return min(section_idx, len(document.sections) - 1)
+        if child.tag != qn("w:p"):
+            continue
+        p_pr = child.find(qn("w:pPr"))
+        sect_pr = p_pr.find(qn("w:sectPr")) if p_pr is not None else None
+        if sect_pr is not None:
+            section_idx += 1
+    return min(section_idx, len(document.sections) - 1)
 
 
-def apply_page_number_from_intro(document: Document, start_idx: int, page_number_config: dict) -> None:
-    intro_section = _insert_intro_section_break(document, start_idx)
+def _ensure_section_break_at(document: Document, paragraph) -> "object":
+    """保证 paragraph 是某个 section 的首段；返回该 section。"""
+    prev = _prev_paragraph(paragraph)
+    sections = list(document.sections)
+    if prev is None:
+        return sections[0]
+
+    p_pr = prev._p.find(qn("w:pPr"))
+    existing_sect_pr = p_pr.find(qn("w:sectPr")) if p_pr is not None else None
+    if existing_sect_pr is not None:
+        for idx, section in enumerate(sections):
+            if section._sectPr is existing_sect_pr:
+                # 段落级 sectPr 描述的是 *前一个* section，所以目标 section 是下一个。
+                if idx + 1 < len(sections):
+                    return sections[idx + 1]
+                return sections[idx]
+        return sections[-1]
+
+    # 前一段没有独立 sectPr：把 body 级 sectPr 复制到前一段，形成新分节。
+    body_sect_pr = document._body._element.sectPr
+    if body_sect_pr is None:
+        return sections[0]
+    p_pr = prev._p.get_or_add_pPr()
+    p_pr.append(deepcopy(body_sect_pr))
+    return document.sections[_section_index_for_paragraph(document, paragraph)]
+
+
+def apply_document_setup(
+    document: Document,
+    segments: DocumentSegments,
+    config: dict,
+) -> None:
+    """全局设置：页边距、引言处分节、引言起页码。"""
     _ensure_margins(document)
+    page_number_config = config.get("page_number", {})
 
-    for section in document.sections:
+    # 页码起点：优先引言；没有引言则退化为首个非空段落。
+    start_paragraph = segments.intro_title
+    if start_paragraph is None:
+        for para in document.paragraphs:
+            if para.text.strip():
+                start_paragraph = para
+                break
+    if start_paragraph is None:
+        return
+
+    intro_section = _ensure_section_break_at(document, start_paragraph)
+    intro_sect_pr = intro_section._sectPr
+
+    sections = list(document.sections)
+    intro_section_idx = 0
+    for idx, section in enumerate(sections):
+        if section._sectPr is intro_sect_pr:
+            intro_section_idx = idx
+            break
+
+    for idx, section in enumerate(sections):
         section.different_first_page_header_footer = False
         section.odd_and_even_pages_header_footer = False
+        if idx < intro_section_idx:
+            _remove_footer_references(section)
+            continue
         footer = section.footer
         footer.is_linked_to_previous = False
         _clear_footer(footer)
 
     _set_page_number_start(intro_section, int(page_number_config.get("start", 1)))
-    intro_found = False
-    for section in document.sections:
-        if section is intro_section:
-            intro_found = True
-        if not intro_found:
+
+    intro_reached = False
+    for section in sections:
+        # document.sections 每次迭代返回新的 Section 包装对象，
+        # 比较底层 sectPr 节点才是稳定身份。
+        if section._sectPr is intro_sect_pr:
+            intro_reached = True
+        if not intro_reached:
             continue
         footer = section.footer
         footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
         footer_para.text = ""
-        footer_para.alignment = _resolve_alignment(page_number_config.get("alignment")) or WD_PARAGRAPH_ALIGNMENT.RIGHT
+        footer_para.alignment = (
+            _resolve_alignment(page_number_config.get("alignment"))
+            or WD_PARAGRAPH_ALIGNMENT.RIGHT
+        )
         _add_page_number_run(footer_para)
         for run in footer_para.runs:
             _set_run_font(
@@ -446,215 +915,26 @@ def apply_page_number_from_intro(document: Document, start_idx: int, page_number
             )
 
 
-def _enforce_structure(document: Document, config: dict, start_idx: int) -> None:
-    style_config = config["styles"]
-    page_only_titles = _reference_title_tokens(config) | {"引言", "致谢"}
-
-    idx = start_idx
-    while idx < len(document.paragraphs):
-        paragraph = document.paragraphs[idx]
-        text = paragraph.text.strip()
-        if not text:
-            idx += 1
-            continue
-
-        normalized = _normalize_title_token(text)
-        plain_title = _strip_number_prefix(text).strip()
-        level = _heading_level_by_prefix(text)
-        is_intro_title = _is_intro_title(text)
-        is_conclusion_title = normalized == "结语"
-        is_page_only_title = normalized in page_only_titles
-        is_h1 = level == 1
-        is_h3 = level == 3
-
-        # 只对标题执行结构空行规则，避免清理正文中的手动换行。
-        if not (is_intro_title or is_page_only_title or is_conclusion_title or is_h1 or is_h3 or level == 2):
-            idx += 1
-            continue
-
-        # 空行规则：
-        # - 引言：前换页，后空一行
-        # - 正文一级标题/结语：上下一行
-        # - 二级标题：上下不空行
-        # - 三级标题：上空一下空零
-        # - 参考文献/致谢：前换页，后空一行
-        needs_blank_before = is_h1 or is_h3 or is_conclusion_title
-        if is_intro_title or is_page_only_title:
-            needs_blank_before = False
-        needs_blank_after = is_h1 or is_intro_title or is_page_only_title or is_conclusion_title
-
-        # 引言/参考文献/致谢前不空行，并强制换页。
-        if is_page_only_title and idx > 0:
-            prev_para = document.paragraphs[idx - 1]
-            prev_para.add_run().add_break(WD_BREAK.PAGE)
-            while idx > 0 and _is_blank_paragraph(document.paragraphs[idx - 1]):
-                _delete_paragraph(document.paragraphs[idx - 1])
-                idx -= 1
-            paragraph = document.paragraphs[idx]
-            paragraph.paragraph_format.space_before = Pt(0)
-            apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-        elif is_intro_title:
-            while idx > 0 and _is_blank_paragraph(document.paragraphs[idx - 1]):
-                _delete_paragraph(document.paragraphs[idx - 1])
-                idx -= 1
-            paragraph = document.paragraphs[idx]
-            paragraph.paragraph_format.space_before = Pt(0)
-
-        if needs_blank_before:
-            if idx == 0 or _is_blank_paragraph(document.paragraphs[idx - 1]):
-                while idx > 1 and _is_blank_paragraph(document.paragraphs[idx - 1]) and _is_blank_paragraph(document.paragraphs[idx - 2]):
-                    _delete_paragraph(document.paragraphs[idx - 2])
-                    idx -= 1
-            else:
-                blank_before = _insert_blank_paragraph_before(paragraph)
-                apply_paragraph_rule(blank_before, style_config[STYLE_BODY])
-                blank_before.paragraph_format.first_line_indent = Pt(0)
-                idx += 1
-                paragraph = document.paragraphs[idx]
-        else:
-            while idx > 0 and _is_blank_paragraph(document.paragraphs[idx - 1]):
-                _delete_paragraph(document.paragraphs[idx - 1])
-                idx -= 1
-                paragraph = document.paragraphs[idx]
-
-        if needs_blank_after:
-            if idx + 1 >= len(document.paragraphs):
-                blank_after = _insert_blank_paragraph_after(paragraph)
-                apply_paragraph_rule(blank_after, style_config[STYLE_BODY])
-                blank_after.paragraph_format.first_line_indent = Pt(0)
-            elif not _is_blank_paragraph(document.paragraphs[idx + 1]):
-                blank_after = _insert_blank_paragraph_after(paragraph)
-                apply_paragraph_rule(blank_after, style_config[STYLE_BODY])
-                blank_after.paragraph_format.first_line_indent = Pt(0)
-            while idx + 2 < len(document.paragraphs) and _is_blank_paragraph(document.paragraphs[idx + 1]) and _is_blank_paragraph(document.paragraphs[idx + 2]):
-                _delete_paragraph(document.paragraphs[idx + 2])
-        else:
-            while idx + 1 < len(document.paragraphs) and _is_blank_paragraph(document.paragraphs[idx + 1]):
-                _delete_paragraph(document.paragraphs[idx + 1])
-
-        idx += 1
-
-
-def apply_required_format(document: Document, config: dict) -> int:
-    style_config = config["styles"]
-    start_idx = _find_start_index(document)
-
-    chapter_idx = 0
-    section_idx = 0
-    sub_idx = 0
-    in_references = False
-    in_ack = False
-    heading_num_id = _create_heading_numbering(document)
-
-    for idx, paragraph in enumerate(document.paragraphs):
-        if idx < start_idx:
-            continue
-        text = paragraph.text.strip()
-        if not text:
-            continue
-        if paragraph._p.xpath(".//w:footnoteReference"):
-            continue
-        if paragraph._p.xpath(".//w:drawing"):
-            continue
-        if _is_figure_caption(text):
-            apply_paragraph_rule(paragraph, style_config[STYLE_BODY])
-            paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-            paragraph.paragraph_format.first_line_indent = Pt(0)
-            for run in paragraph.runs:
-                _set_run_font(run, "黑体", 10.5, False)
-            continue
-
-        stripped = _strip_number_prefix(text)
-        normalized = _normalize_title_token(text)
-        if _is_reference_title(text, config):
-            in_references = True
-            in_ack = False
-            _set_paragraph_text(paragraph, "参考文献")
-            apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-            paragraph.paragraph_format.space_before = Pt(0)
-            continue
-        if normalized == "致谢":
-            in_ack = True
-            in_references = False
-            _set_paragraph_text(paragraph, "致谢")
-            apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-            continue
-        if _is_intro_title(text):
-            _set_paragraph_text(paragraph, "引言")
-            apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-            paragraph.paragraph_format.space_before = Pt(0)
-            chapter_idx = 0
-            section_idx = 0
-            sub_idx = 0
-            continue
-        if normalized == "结语":
-            _set_paragraph_text(paragraph, "结语")
-            apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-            continue
-
-        if in_references:
-            apply_paragraph_rule(
-                paragraph,
-                {
-                    "east_asia_font": "宋体",
-                    "size_pt": 10.5,
-                    "bold": False,
-                    "line_spacing": 1.5,
-                    "alignment": "left",
-                    "hanging_indent_chars": 2,
-                },
-            )
-            continue
-        if in_ack:
-            apply_paragraph_rule(paragraph, style_config[STYLE_BODY])
-            continue
-
-        if _looks_like_heading(paragraph):
-            level = _heading_level_by_prefix(text)
-            if level is None:
-                style_key = _resolve_rule_key(paragraph)
-                if style_key == STYLE_H2:
-                    level = 2
-                elif style_key == STYLE_H3:
-                    level = 3
-                else:
-                    level = 1
-
-            if level == 1:
-                chapter_idx += 1
-                section_idx = 0
-                sub_idx = 0
-                _set_paragraph_text(paragraph, _strip_number_prefix(text))
-                _set_heading_numbering(paragraph, heading_num_id, 0)
-                apply_paragraph_rule(paragraph, style_config[STYLE_H1])
-            elif level == 2:
-                if chapter_idx == 0:
-                    chapter_idx = 1
-                section_idx += 1
-                sub_idx = 0
-                _set_paragraph_text(paragraph, _strip_number_prefix(text))
-                _set_heading_numbering(paragraph, heading_num_id, 1)
-                apply_paragraph_rule(paragraph, style_config[STYLE_H2])
-            else:
-                if chapter_idx == 0:
-                    chapter_idx = 1
-                if section_idx == 0:
-                    section_idx = 1
-                sub_idx += 1
-                _set_paragraph_text(paragraph, _strip_number_prefix(text))
-                _set_heading_numbering(paragraph, heading_num_id, 2)
-                apply_paragraph_rule(paragraph, style_config[STYLE_H3])
-        else:
-            apply_paragraph_rule(paragraph, style_config[STYLE_BODY])
-
-    return start_idx
-
+# ============================================================
+# --- entry points ---
+# ============================================================
 
 def apply_mvp_format(doc_path: Path, output_path: Path, config: dict) -> None:
+    """
+    流水线入口：
+      1. 扫描切段
+      2. 正文（引言 -> 结语）
+      3. 参考文献
+      4. 致谢
+      5. 全局设置（页边距 / 分节 / 页码）
+    每段处理互不依赖；顺序与作者写作顺序自然一致。
+    """
     document = Document(str(doc_path))
-    start_idx = apply_required_format(document, config)
-    _enforce_structure(document, config, start_idx)
-    apply_page_number_from_intro(document, start_idx, config.get("page_number", {}))
+    segments = scan_segments(document, config)
+    process_body(segments, config)
+    process_references(segments, config)
+    process_acknowledgment(segments, config)
+    apply_document_setup(document, segments, config)
     document.save(str(output_path))
 
 
@@ -667,7 +947,6 @@ def iter_docx_files(root_dir: Path) -> list[Path]:
 
 
 def build_output_path(src: Path) -> Path:
-    """Create an output path in the same directory with suffix."""
     return src.with_name(f"{src.stem}{OUTPUT_SUFFIX}{src.suffix}")
 
 
@@ -687,11 +966,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG_PATH,
         help=f"Path to config json (default: {DEFAULT_CONFIG_PATH.name})",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logs for landmark detection",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.debug:
+        os.environ["PAPER_FORMAT_DEBUG"] = "1"
     try:
         config = load_config(args.config)
     except Exception as exc:
