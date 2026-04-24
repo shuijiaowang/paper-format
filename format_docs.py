@@ -234,6 +234,13 @@ def _next_paragraph(paragraph) -> Paragraph | None:
     return Paragraph(element, paragraph._parent)
 
 
+def _prev_nonblank_paragraph(paragraph) -> Paragraph | None:
+    prev = _prev_paragraph(paragraph)
+    while prev is not None and _is_blank_paragraph(prev):
+        prev = _prev_paragraph(prev)
+    return prev
+
+
 def _is_blank_paragraph(paragraph) -> bool:
     if paragraph._p is None:
         return True
@@ -272,11 +279,19 @@ def _paragraph_has_page_break(paragraph) -> bool:
     return bool(paragraph._p.xpath(".//w:br[@w:type='page']"))
 
 
-def _ensure_page_break_before(paragraph) -> None:
+def _page_break_count(paragraph) -> int:
+    if paragraph is None or paragraph._p is None:
+        return 0
+    return len(paragraph._p.xpath(".//w:br[@w:type='page']"))
+
+
+def _ensure_page_break_before(paragraph, count: int = 1) -> None:
     prev = _prev_paragraph(paragraph)
-    if prev is None or _paragraph_has_page_break(prev):
+    if prev is None:
         return
-    prev.add_run().add_break(WD_BREAK.PAGE)
+    existing = _page_break_count(prev)
+    for _ in range(max(count - existing, 0)):
+        prev.add_run().add_break(WD_BREAK.PAGE)
 
 
 def _make_blank_body_paragraph(paragraph) -> None:
@@ -565,11 +580,11 @@ def _apply_figure_caption(paragraph, text: str) -> None:
     paragraph.paragraph_format.first_line_indent = Pt(0)
 
 
-def _apply_page_title(paragraph, title_text: str) -> None:
+def _apply_page_title(paragraph, title_text: str, page_break_count: int = 1) -> None:
     _set_paragraph_text(paragraph, title_text)
     apply_paragraph_rule(paragraph, H1_RULE)
     paragraph.paragraph_format.space_before = Pt(0)
-    _ensure_page_break_before(paragraph)
+    _ensure_page_break_before(paragraph, page_break_count)
     _remove_blanks_before(paragraph)
     _ensure_blank_after(paragraph)
     _collapse_blanks_after(paragraph)
@@ -598,8 +613,12 @@ def _format_h2(paragraph, prefix: str, plain_text: str) -> None:
 def _format_h3(paragraph, prefix: str, plain_text: str) -> None:
     _set_paragraph_text(paragraph, f"{prefix}{plain_text}")
     apply_paragraph_rule(paragraph, H3_RULE)
-    _ensure_blank_before(paragraph)
-    _collapse_blanks_before(paragraph)
+    prev_nonblank = _prev_nonblank_paragraph(paragraph)
+    if prev_nonblank is not None and _resolve_heading_level(prev_nonblank) == 2:
+        _remove_blanks_before(paragraph)
+    else:
+        _ensure_blank_before(paragraph)
+        _collapse_blanks_before(paragraph)
     _remove_blanks_after(paragraph)
 
 
@@ -805,7 +824,7 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
         report.missing_landmarks.append(INTRO_TITLE_TEXT)
         return
 
-    _apply_page_title(segments.intro_title, INTRO_TITLE_TEXT)
+    _apply_page_title(segments.intro_title, INTRO_TITLE_TEXT, page_break_count=2)
     report.section_titles += 1
 
     chapter_idx = 0
