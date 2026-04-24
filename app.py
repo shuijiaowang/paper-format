@@ -7,14 +7,12 @@ from tempfile import TemporaryDirectory
 from flask import Flask, jsonify, request, send_file
 from werkzeug.utils import secure_filename
 
-from format_docs import OUTPUT_SUFFIX, apply_mvp_format, load_config
+from format_docs import OUTPUT_SUFFIX, apply_mvp_format
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = BASE_DIR / "config.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
 app = Flask(__name__)
-config = load_config(CONFIG_PATH)
 
 
 @app.get("/")
@@ -41,7 +39,7 @@ def format_docx():
         out = tmp_path / out_name
 
         upload.save(src)
-        report = apply_mvp_format(src, out, config)
+        report = apply_mvp_format(src, out)
         output_bytes = out.read_bytes()
         encoded_file = base64.b64encode(output_bytes).decode("ascii")
         return jsonify(
