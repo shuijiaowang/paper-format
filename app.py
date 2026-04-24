@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from io import BytesIO
+import base64
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -41,13 +41,15 @@ def format_docx():
         out = tmp_path / out_name
 
         upload.save(src)
-        apply_mvp_format(src, out, config)
+        report = apply_mvp_format(src, out, config)
         output_bytes = out.read_bytes()
-        return send_file(
-            BytesIO(output_bytes),
-            as_attachment=True,
-            download_name=out_name,
-            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        encoded_file = base64.b64encode(output_bytes).decode("ascii")
+        return jsonify(
+            {
+                "download_name": out_name,
+                "file_base64": encoded_file,
+                "report": report.to_dict(),
+            }
         )
 
 

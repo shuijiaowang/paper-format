@@ -46,6 +46,42 @@
         margin-top: 12px;
         min-height: 20px;
       }
+      .report {
+        margin-top: 16px;
+        padding: 12px 14px;
+        background: #f7f9ff;
+        border: 1px solid #dce5ff;
+        border-radius: 8px;
+      }
+      .report h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      .report ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      .report li {
+        margin: 4px 0;
+      }
+      .doc {
+        margin-top: 16px;
+        padding: 12px 14px;
+        background: #fffaf0;
+        border: 1px solid #ffe2a8;
+        border-radius: 8px;
+      }
+      .doc h2 {
+        margin: 0 0 8px;
+        font-size: 16px;
+      }
+      .doc ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      .doc li {
+        margin: 4px 0;
+      }
     </style>
   </head>
   <body>
@@ -57,12 +93,66 @@
       </div>
       <button id="submitBtn">上传并格式化</button>
       <div id="status"></div>
+      <div class="doc">
+        <h2>格式化说明（打开页面即可查看）</h2>
+        <ul>
+          <li>封面、声明、摘要、目录不做处理</li>
+          <li>统一正文、一级/二级/三级标题的字体、字号、行距、对齐方式。</li>
+          <li>识别并规范“引言、结语、参考文献、致谢”等章节标题。</li>
+          <li>自动处理标题前后空行规则（不同级别标题规则不同）。</li>
+          <li>识别图题（如“图1 ...”）并按图题样式居中格式化。</li>
+          <li>统一参考文献段落格式，设置悬挂缩进等规则。</li>
+          <li>统一页面页边距，并从引言处开始设置页码格式。</li>
+          <li>不改变你原始上传文件，只生成格式化后的新文件下载。</li>
+        </ul>
+      </div>
+      <div id="report" class="report" style="display: none">
+        <h2>本次处理统计（处理后）</h2>
+        <ul id="reportList"></ul>
+      </div>
     </div>
 
     <script>
       const submitBtn = document.getElementById("submitBtn");
       const fileInput = document.getElementById("fileInput");
       const statusEl = document.getElementById("status");
+      const reportEl = document.getElementById("report");
+      const reportListEl = document.getElementById("reportList");
+
+      function renderReport(report) {
+        if (!report) {
+          reportEl.style.display = "none";
+          return;
+        }
+        const landmarks = Array.isArray(report.landmarks) && report.landmarks.length
+          ? report.landmarks.join("、")
+          : "未检测到";
+        const items = [
+          `文档总段落数：${report.total_paragraphs || 0}`,
+          `识别到的关键章节：${landmarks}`,
+          `处理的章节标题（引言/结语/参考文献/致谢）：${report.section_titles || 0}`,
+          `处理的正文标题段（1-3级）：${report.body_titles || 0}`,
+          `处理的正文段落：${report.body_text || 0}`,
+          `处理的图题段落：${report.figure_captions || 0}`,
+          `处理的参考文献段落：${report.references_text || 0}`,
+          `处理的致谢段落：${report.acknowledgment_text || 0}`,
+          `更新页边距的节数：${report.margins_updated || 0}`,
+          `更新页码的节数：${report.page_numbers_updated || 0}`,
+        ];
+        reportListEl.innerHTML = items.map((item) => `<li>${item}</li>`).join("");
+        reportEl.style.display = "block";
+      }
+
+      function decodeBase64ToBlob(base64Data) {
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i += 1) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        return new Blob([bytes], {
+          type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
+      }
 
       submitBtn.addEventListener("click", async () => {
         const file = fileInput.files[0];
@@ -73,6 +163,7 @@
 
         submitBtn.disabled = true;
         statusEl.textContent = "处理中，请稍候...";
+        reportEl.style.display = "none";
 
         try {
           const formData = new FormData();
@@ -92,16 +183,15 @@
             throw new Error(message);
           }
 
-          const blob = await response.blob();
+          const data = await response.json();
+          if (!data.file_base64) {
+            throw new Error("服务端未返回格式化文件");
+          }
+          renderReport(data.report);
+
+          const blob = decodeBase64ToBlob(data.file_base64);
           const url = window.URL.createObjectURL(blob);
-          const contentDisposition = response.headers.get("Content-Disposition") || "";
-          const utf8Matched = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
-          const plainMatched = contentDisposition.match(/filename="?([^"]+)"?/i);
-          const fileName = utf8Matched
-            ? decodeURIComponent(utf8Matched[1])
-            : plainMatched
-              ? plainMatched[1]
-              : "formatted.docx";
+          const fileName = data.download_name || "formatted.docx";
 
           const a = document.createElement("a");
           a.href = url;

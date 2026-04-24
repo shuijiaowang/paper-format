@@ -371,7 +371,9 @@ def _create_heading_numbering(document: Document) -> int:
     numfmt0.set(qn("w:val"), "chineseCounting")
     lvltext0 = OxmlElement("w:lvlText")
     lvltext0.set(qn("w:val"), "%1、")
-    lvl0.extend([start0, numfmt0, lvltext0])
+    suff0 = OxmlElement("w:suff")
+    suff0.set(qn("w:val"), "space")
+    lvl0.extend([start0, numfmt0, lvltext0, suff0])
     _append_numbering_rpr(lvl0, 15.0)
 
     # 二级：（一）（二）（三）
@@ -383,7 +385,9 @@ def _create_heading_numbering(document: Document) -> int:
     numfmt1.set(qn("w:val"), "chineseCounting")
     lvltext1 = OxmlElement("w:lvlText")
     lvltext1.set(qn("w:val"), "（%2）")
-    lvl1.extend([start1, numfmt1, lvltext1])
+    suff1 = OxmlElement("w:suff")
+    suff1.set(qn("w:val"), "space")
+    lvl1.extend([start1, numfmt1, lvltext1, suff1])
     _append_numbering_rpr(lvl1, 14.0)
 
     # 三级：1. 2. 3.
@@ -395,7 +399,9 @@ def _create_heading_numbering(document: Document) -> int:
     numfmt2.set(qn("w:val"), "decimal")
     lvltext2 = OxmlElement("w:lvlText")
     lvltext2.set(qn("w:val"), "%3.")
-    lvl2.extend([start2, numfmt2, lvltext2])
+    suff2 = OxmlElement("w:suff")
+    suff2.set(qn("w:val"), "space")
+    lvl2.extend([start2, numfmt2, lvltext2, suff2])
     _append_numbering_rpr(lvl2, 12.0)
 
     abstract_num.extend([lvl0, lvl1, lvl2])
@@ -512,6 +518,34 @@ class DocumentSegments:
     references_body: list[Paragraph] = field(default_factory=list)
     ack_title: Paragraph | None = None
     ack_body: list[Paragraph] = field(default_factory=list)
+
+
+@dataclass
+class FormatReport:
+    total_paragraphs: int = 0
+    landmarks: list[str] = field(default_factory=list)
+    body_titles: int = 0
+    body_text: int = 0
+    figure_captions: int = 0
+    references_text: int = 0
+    acknowledgment_text: int = 0
+    section_titles: int = 0
+    margins_updated: int = 0
+    page_numbers_updated: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "total_paragraphs": self.total_paragraphs,
+            "landmarks": self.landmarks,
+            "body_titles": self.body_titles,
+            "body_text": self.body_text,
+            "figure_captions": self.figure_captions,
+            "references_text": self.references_text,
+            "acknowledgment_text": self.acknowledgment_text,
+            "section_titles": self.section_titles,
+            "margins_updated": self.margins_updated,
+            "page_numbers_updated": self.page_numbers_updated,
+        }
 
 
 def scan_segments(document: Document, config: dict) -> DocumentSegments:
@@ -642,7 +676,7 @@ def _apply_page_title_style(paragraph, rule: dict) -> None:
 
 # ---------- Body (引言 -> 结语) ----------
 
-def process_body(segments: DocumentSegments, config: dict) -> None:
+def process_body(segments: DocumentSegments, config: dict, report: FormatReport | None = None) -> None:
     """独立处理正文段：引言 / H1 / H2 / H3 / 图序 / 正文 / 结语，含段内空行规则。"""
     if not segments.body_paragraphs:
         return
@@ -679,6 +713,8 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
             chapter_idx = 0
             section_idx = 0
             sub_idx = 0
+            if report is not None:
+                report.section_titles += 1
             continue
 
         # 结语：上下各空一行；不参与编号
@@ -689,6 +725,8 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
             _collapse_blanks_before(paragraph)
             _ensure_blank_after(paragraph, body_rule)
             _collapse_blanks_after(paragraph)
+            if report is not None:
+                report.section_titles += 1
             continue
 
         # 脚注 / 图片：保持原样
@@ -699,6 +737,8 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
 
         if _is_figure_caption(text):
             _apply_figure_caption(paragraph, body_rule)
+            if report is not None:
+                report.figure_captions += 1
             continue
 
         if _looks_like_heading(paragraph):
@@ -715,6 +755,8 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
                 _collapse_blanks_before(paragraph)
                 _ensure_blank_after(paragraph, body_rule)
                 _collapse_blanks_after(paragraph)
+                if report is not None:
+                    report.body_titles += 1
             elif level == 2:
                 if chapter_idx == 0:
                     chapter_idx = 1
@@ -726,6 +768,8 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
                 # 二级标题上下无换行
                 _remove_blanks_before(paragraph)
                 _remove_blanks_after(paragraph)
+                if report is not None:
+                    report.body_titles += 1
             else:
                 if chapter_idx == 0:
                     chapter_idx = 1
@@ -739,15 +783,19 @@ def process_body(segments: DocumentSegments, config: dict) -> None:
                 _ensure_blank_before(paragraph, body_rule)
                 _collapse_blanks_before(paragraph)
                 _remove_blanks_after(paragraph)
+                if report is not None:
+                    report.body_titles += 1
             continue
 
         # 普通正文：不清理前后空行（保留手动空行）
         apply_paragraph_rule(paragraph, body_rule)
+        if report is not None:
+            report.body_text += 1
 
 
 # ---------- References ----------
 
-def process_references(segments: DocumentSegments, config: dict) -> None:
+def process_references(segments: DocumentSegments, config: dict, report: FormatReport | None = None) -> None:
     """独立处理参考文献段。"""
     if segments.references_title is None:
         return
@@ -755,6 +803,8 @@ def process_references(segments: DocumentSegments, config: dict) -> None:
     title = segments.references_title
     _set_paragraph_text(title, REFERENCES_TITLE_TEXT)
     _apply_page_title_style(title, config["styles"][STYLE_H1])
+    if report is not None:
+        report.section_titles += 1
 
     # 前换页、前不空行、后空一行
     _ensure_page_break_before(title)
@@ -767,11 +817,13 @@ def process_references(segments: DocumentSegments, config: dict) -> None:
         if _is_blank_paragraph(paragraph):
             continue
         apply_paragraph_rule(paragraph, REFERENCES_BODY_RULE)
+        if report is not None:
+            report.references_text += 1
 
 
 # ---------- Acknowledgment ----------
 
-def process_acknowledgment(segments: DocumentSegments, config: dict) -> None:
+def process_acknowledgment(segments: DocumentSegments, config: dict, report: FormatReport | None = None) -> None:
     """独立处理致谢段。"""
     if segments.ack_title is None:
         return
@@ -779,6 +831,8 @@ def process_acknowledgment(segments: DocumentSegments, config: dict) -> None:
     title = segments.ack_title
     _set_paragraph_text(title, ACK_TITLE_TEXT)
     _apply_page_title_style(title, config["styles"][STYLE_H1])
+    if report is not None:
+        report.section_titles += 1
 
     _ensure_page_break_before(title)
     _remove_blanks_before(title)
@@ -792,6 +846,8 @@ def process_acknowledgment(segments: DocumentSegments, config: dict) -> None:
         if paragraph._p.xpath(".//w:footnoteReference"):
             continue
         apply_paragraph_rule(paragraph, body_rule)
+        if report is not None:
+            report.acknowledgment_text += 1
 
 
 # ============================================================
@@ -853,9 +909,12 @@ def apply_document_setup(
     document: Document,
     segments: DocumentSegments,
     config: dict,
+    report: FormatReport | None = None,
 ) -> None:
     """全局设置：页边距、引言处分节、引言起页码。"""
     _ensure_margins(document)
+    if report is not None:
+        report.margins_updated = len(document.sections)
     page_number_config = config.get("page_number", {})
 
     # 页码起点：优先引言；没有引言则退化为首个非空段落。
@@ -913,13 +972,15 @@ def apply_document_setup(
                 float(page_number_config.get("font_size_pt", 9)),
                 False,
             )
+    if report is not None:
+        report.page_numbers_updated = max(len(sections) - intro_section_idx, 0)
 
 
 # ============================================================
 # --- entry points ---
 # ============================================================
 
-def apply_mvp_format(doc_path: Path, output_path: Path, config: dict) -> None:
+def apply_mvp_format(doc_path: Path, output_path: Path, config: dict) -> FormatReport:
     """
     流水线入口：
       1. 扫描切段
@@ -930,12 +991,24 @@ def apply_mvp_format(doc_path: Path, output_path: Path, config: dict) -> None:
     每段处理互不依赖；顺序与作者写作顺序自然一致。
     """
     document = Document(str(doc_path))
+    report = FormatReport(total_paragraphs=len(document.paragraphs))
     segments = scan_segments(document, config)
-    process_body(segments, config)
-    process_references(segments, config)
-    process_acknowledgment(segments, config)
-    apply_document_setup(document, segments, config)
+    landmark_names: list[str] = []
+    if segments.intro_title is not None:
+        landmark_names.append("引言")
+    if segments.conclusion_title is not None:
+        landmark_names.append("结语")
+    if segments.references_title is not None:
+        landmark_names.append("参考文献")
+    if segments.ack_title is not None:
+        landmark_names.append("致谢")
+    report.landmarks = landmark_names
+    process_body(segments, config, report)
+    process_references(segments, config, report)
+    process_acknowledgment(segments, config, report)
+    apply_document_setup(document, segments, config, report)
     document.save(str(output_path))
+    return report
 
 
 def iter_docx_files(root_dir: Path) -> list[Path]:
