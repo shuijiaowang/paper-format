@@ -105,7 +105,7 @@ HEADING_PREFIX_PATTERN = re.compile(
     rf"^(?:{CHINESE_H1_PREFIX_RE}|{CHINESE_H2_PREFIX_RE}(?:[.、．。])?|{ARABIC_HEADING_STRIP_PREFIX_RE})\s*"
 )
 FIGURE_PREFIX_PATTERN = re.compile(r"^图\s*\d+(?:\s*[-－]\s*\d+)?\s*")
-DEFAULT_FIGURE_CAPTION_TEXT = "1.1 题注"
+DEFAULT_FIGURE_CAPTION_TEXT = "图1.1 题注"
 
 
 def _debug_enabled() -> bool:
