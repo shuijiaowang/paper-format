@@ -105,6 +105,7 @@ HEADING_PREFIX_PATTERN = re.compile(
     rf"^(?:{CHINESE_H1_PREFIX_RE}|{CHINESE_H2_PREFIX_RE}(?:[.、．。])?|{ARABIC_HEADING_STRIP_PREFIX_RE})\s*"
 )
 FIGURE_PREFIX_PATTERN = re.compile(r"^图\s*\d+(?:\s*[-－]\s*\d+)?\s*")
+DEFAULT_FIGURE_CAPTION_TEXT = "1.1 题注"
 
 
 def _debug_enabled() -> bool:
@@ -238,6 +239,8 @@ def _is_blank_paragraph(paragraph) -> bool:
         return True
     if paragraph._p.xpath(".//w:br[@w:type='page']"):
         return False
+    if paragraph._p.xpath(".//w:drawing"):
+        return False
     return not paragraph.text.strip()
 
 
@@ -247,10 +250,14 @@ def _insert_paragraph_before(paragraph) -> Paragraph:
     return Paragraph(element, paragraph._parent)
 
 
-def _insert_blank_paragraph_after(paragraph) -> Paragraph:
+def _insert_paragraph_after(paragraph) -> Paragraph:
     element = OxmlElement("w:p")
     paragraph._p.addnext(element)
     return Paragraph(element, paragraph._parent)
+
+
+def _insert_blank_paragraph_after(paragraph) -> Paragraph:
+    return _insert_paragraph_after(paragraph)
 
 
 def _delete_paragraph(paragraph) -> None:
@@ -548,12 +555,12 @@ def _resolve_heading_level(paragraph) -> int:
 
 
 def _is_figure_caption(text: str) -> bool:
-    return bool(re.match(r"^图\s*\d+", text.strip()))
+    stripped = text.strip()
+    return bool(re.match(r"^图\s*\d+", stripped)) or bool(re.match(r"^\d+(?:\.\d+)+\s*题注", stripped))
 
 
-def _apply_figure_caption(paragraph, label: str, caption_suffix: str) -> None:
-    text = f"{label} {caption_suffix}".strip()
-    _set_paragraph_text(paragraph, text)
+def _apply_figure_caption(paragraph, text: str) -> None:
+    _set_paragraph_text(paragraph, text.strip())
     apply_paragraph_rule(paragraph, FIGURE_CAPTION_RULE)
     paragraph.paragraph_format.first_line_indent = Pt(0)
 
@@ -682,9 +689,115 @@ def _next_figure_label(chapter_figure_counts: dict[int, int], chapter_idx: int) 
 
 
 def _try_apply_image_wrap(paragraph) -> None:
-    # python-docx 不提供稳定的图片环绕 API；保留图片本体，仅处理图序。
     if paragraph._p is None:
         return
+
+    paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+
+    image_runs = [run for run in paragraph.runs if run._element.xpath(".//w:drawing")]
+    if len(image_runs) > 1:
+        for run in image_runs[:-1]:
+            if not run._element.xpath("./w:br"):
+                run.add_break(WD_BREAK.LINE)
+
+    def _child_by_local_name(parent, local_name: str):
+        for child in parent:
+            if child.tag.rsplit("}", 1)[-1] == local_name:
+                return child
+        return None
+
+    def _build_top_bottom_anchor(inline):
+        anchor = OxmlElement("wp:anchor")
+        for key, value in {
+            "distT": "0",
+            "distB": "0",
+            "distL": "0",
+            "distR": "0",
+            "simplePos": "0",
+            "relativeHeight": "0",
+            "behindDoc": "0",
+            "locked": "0",
+            "layoutInCell": "1",
+            "allowOverlap": "0",
+        }.items():
+            anchor.set(key, value)
+
+        simple_pos = OxmlElement("wp:simplePos")
+        simple_pos.set("x", "0")
+        simple_pos.set("y", "0")
+        anchor.append(simple_pos)
+
+        position_h = OxmlElement("wp:positionH")
+        position_h.set("relativeFrom", "column")
+        align = OxmlElement("wp:align")
+        align.text = "center"
+        position_h.append(align)
+        anchor.append(position_h)
+
+        position_v = OxmlElement("wp:positionV")
+        position_v.set("relativeFrom", "paragraph")
+        pos_offset = OxmlElement("wp:posOffset")
+        pos_offset.text = "0"
+        position_v.append(pos_offset)
+        anchor.append(position_v)
+
+        for local_name in ("extent", "effectExtent"):
+            child = _child_by_local_name(inline, local_name)
+            if child is not None:
+                anchor.append(deepcopy(child))
+
+        anchor.append(OxmlElement("wp:wrapTopAndBottom"))
+
+        for local_name in ("docPr", "cNvGraphicFramePr", "graphic"):
+            child = _child_by_local_name(inline, local_name)
+            if child is not None:
+                anchor.append(deepcopy(child))
+
+        return anchor
+
+    for inline in paragraph._p.xpath(".//wp:inline"):
+        parent = inline.getparent()
+        if parent is not None:
+            parent.replace(inline, _build_top_bottom_anchor(inline))
+
+    for anchor in paragraph._p.xpath(".//wp:anchor"):
+        for key, value in {
+            "distT": "0",
+            "distB": "0",
+            "distL": "0",
+            "distR": "0",
+            "behindDoc": "0",
+            "locked": "0",
+            "layoutInCell": "1",
+            "allowOverlap": "0",
+        }.items():
+            anchor.set(key, value)
+
+        wrap = _child_by_local_name(anchor, "wrapTopAndBottom")
+        if wrap is None:
+            wrap = OxmlElement("wp:wrapTopAndBottom")
+            insert_at = next(
+                (
+                    idx
+                    for idx, child in enumerate(anchor)
+                    if child.tag.rsplit("}", 1)[-1] in {"docPr", "cNvGraphicFramePr", "graphic"}
+                ),
+                len(anchor),
+            )
+            anchor.insert(insert_at, wrap)
+
+        position_h = _child_by_local_name(anchor, "positionH")
+        if position_h is None:
+            position_h = OxmlElement("wp:positionH")
+            position_h.set("relativeFrom", "column")
+            anchor.insert(1, position_h)
+        else:
+            position_h.set("relativeFrom", "column")
+            for child in list(position_h):
+                position_h.remove(child)
+        align = OxmlElement("wp:align")
+        align.text = "center"
+        position_h.append(align)
 
 
 def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport) -> None:
@@ -698,11 +811,19 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
     chapter_idx = 0
     section_idx = 0
     sub_idx = 0
-    chapter_figure_counts: dict[int, int] = {}
-    pending_figure_chapter: int | None = None
+    pending_figure_anchor: Paragraph | None = None
+
+    def flush_pending_figure_caption() -> None:
+        nonlocal pending_figure_anchor
+        if pending_figure_anchor is None:
+            return
+        caption = _insert_paragraph_after(pending_figure_anchor)
+        _apply_figure_caption(caption, DEFAULT_FIGURE_CAPTION_TEXT)
+        report.figure_captions += 1
+        pending_figure_anchor = None
 
     def handle_content(paragraph, allow_headings: bool, body_rule_kind: str = "body") -> None:
-        nonlocal chapter_idx, section_idx, sub_idx, pending_figure_chapter
+        nonlocal chapter_idx, section_idx, sub_idx, pending_figure_anchor
         if paragraph._p is None:
             return
         text = paragraph.text.strip()
@@ -711,28 +832,21 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
             return
         if paragraph._p.xpath(".//w:drawing"):
             _try_apply_image_wrap(paragraph)
-            pending_figure_chapter = max(chapter_idx, 1)
+            pending_figure_anchor = paragraph
             return
         if not text:
             return
 
-        if pending_figure_chapter is not None:
-            label = _next_figure_label(chapter_figure_counts, pending_figure_chapter)
+        if pending_figure_anchor is not None:
             if _is_figure_caption(text):
-                suffix = _strip_figure_prefix(text)
-                _apply_figure_caption(paragraph, label, suffix)
+                _apply_figure_caption(paragraph, text)
                 report.figure_captions += 1
-                pending_figure_chapter = None
+                pending_figure_anchor = None
                 return
-            caption = _insert_paragraph_before(paragraph)
-            _apply_figure_caption(caption, label, text)
-            report.figure_captions += 1
-            pending_figure_chapter = None
+            flush_pending_figure_caption()
 
         if _is_figure_caption(text):
-            label = _next_figure_label(chapter_figure_counts, max(chapter_idx, 1))
-            suffix = _strip_figure_prefix(text)
-            _apply_figure_caption(paragraph, label, suffix)
+            _apply_figure_caption(paragraph, text)
             report.figure_captions += 1
             return
 
@@ -763,12 +877,14 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
 
     for paragraph in segments.main_body:
         handle_content(paragraph, allow_headings=True)
+    flush_pending_figure_caption()
 
     if segments.conclusion_title is not None:
         _apply_page_title(segments.conclusion_title, CONCLUSION_TITLE_TEXT)
         report.section_titles += 1
     for paragraph in segments.conclusion_body:
         handle_content(paragraph, allow_headings=False)
+    flush_pending_figure_caption()
 
 
 def format_references(segments: DocumentSegments, report: FormatReport) -> None:
