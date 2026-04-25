@@ -397,7 +397,7 @@ class Landmark(Enum):
 
 def _normalize_title_token(text: str) -> str:
     token = _strip_heading_prefix(text)
-    token = re.sub(r"[\s·•\\-—_<>《》【】\\[\\]()（）:：,，。；;!！?？\"'`]+", "", token)
+    token = re.sub("[ \u3000\u00A0\\s·•\\-—_<>《》【】\\[\\]()（）:：,，。；;!！?？\"'`]+", "", token)
     return token
 
 
@@ -824,7 +824,7 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
         report.missing_landmarks.append(INTRO_TITLE_TEXT)
         return
 
-    _apply_page_title(segments.intro_title, INTRO_TITLE_TEXT, page_break_count=2)
+    _apply_page_title(segments.intro_title, "引  言", page_break_count=2)
     report.section_titles += 1
 
     chapter_idx = 0
@@ -899,7 +899,7 @@ def format_intro_and_main_body(segments: DocumentSegments, report: FormatReport)
     flush_pending_figure_caption()
 
     if segments.conclusion_title is not None:
-        _apply_page_title(segments.conclusion_title, CONCLUSION_TITLE_TEXT)
+        _apply_page_title(segments.conclusion_title, "结  语")
         report.section_titles += 1
     for paragraph in segments.conclusion_body:
         handle_content(paragraph, allow_headings=False)
@@ -923,7 +923,7 @@ def format_acknowledgment(segments: DocumentSegments, report: FormatReport) -> N
     if segments.ack_title is None:
         report.missing_landmarks.append(ACK_TITLE_TEXT)
         return
-    _apply_page_title(segments.ack_title, ACK_TITLE_TEXT)
+    _apply_page_title(segments.ack_title, "致  谢")
     report.section_titles += 1
     for paragraph in segments.ack_body:
         if _is_blank_paragraph(paragraph) or paragraph._p.xpath(".//w:footnoteReference"):
